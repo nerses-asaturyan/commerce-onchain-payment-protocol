@@ -13,7 +13,8 @@ const { ethers } = require("ethers");
     WRAPPED_NATIVE_ADDRESS,
     USDC_ADDRESS,
     UNISWAP_V3_FACTORY,
-    UNISWAP_V3_QUOTER,
+    UNISWAP_V3_QUOTER_V1,
+    UNISWAP_V3_QUOTER_V2,
     POOL_FEE_TIER,
     RECIPIENT_AMOUNT_WEI,
     FEE_AMOUNT_WEI,
@@ -30,7 +31,8 @@ const { ethers } = require("ethers");
   const weth = ethers.getAddress(WRAPPED_NATIVE_ADDRESS);
   const usdc = ethers.getAddress(USDC_ADDRESS);
   const uniFactory = ethers.getAddress(UNISWAP_V3_FACTORY);
-  const quoter = ethers.getAddress(UNISWAP_V3_QUOTER);
+  const quoterV1Addr = UNISWAP_V3_QUOTER_V1 ? ethers.getAddress(UNISWAP_V3_QUOTER_V1) : null;
+  const quoterV2Addr = UNISWAP_V3_QUOTER_V2 ? ethers.getAddress(UNISWAP_V3_QUOTER_V2) : null;
 
   const feeTier = Number(POOL_FEE_TIER || 3000);
   const wantRecipient0 = BigInt(RECIPIENT_AMOUNT_WEI ?? ethers.parseUnits("5", 6));
@@ -40,9 +42,17 @@ const { ethers } = require("ethers");
   const transfersAbi = [
     "function swapAndTransferUniswapV3Native((uint256,uint256,address,address,address,uint256,bytes16,address,bytes,bytes),uint24) external payable"
   ];
-  const factoryAbi = ["function getPool(address,address,uint24) view returns (address)"];
-  const quoterV1Abi = ["function quoteExactOutputSingle(address,address,uint256,uint24,uint160) view returns (uint256)"];
-  const quoterV2Abi = ["function quoteExactOutputSingle((address tokenIn,address tokenOut,uint24 fee,uint256 amountOut,uint160 sqrtPriceLimitX96)) view returns (uint256)"];
+  const factoryAbi = [
+    "function getPool(address tokenA,address tokenB,uint24 fee) view returns (address pool)"
+  ];
+  const quoterV1Abi = [
+    "function quoteExactOutputSingle(address tokenIn,address tokenOut,uint24 fee,uint256 amountOut,uint160 sqrtPriceLimitX96) returns (uint256 amountIn)"
+  ];
+  const quoterV2Abi = [
+    "function quoteExactOutputSingle((address tokenIn,address tokenOut,uint256 amount,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountIn,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)"
+  ];
+
+  if (!quoterV1Addr && !quoterV2Addr) throw new Error("Provide UNISWAP_V3_QUOTER_V1 or UNISWAP_V3_QUOTER_V2");
 
   const factory = new ethers.Contract(uniFactory, factoryAbi, provider);
   const [a, b] = (ethers.getBigInt(weth) < ethers.getBigInt(usdc)) ? [weth, usdc] : [usdc, weth];
@@ -55,14 +65,22 @@ const { ethers } = require("ethers");
   if (budget <= cushion) throw new Error("Low balance");
   budget -= cushion;
 
-  const q1 = new ethers.Contract(quoter, quoterV1Abi, provider);
-  const q2 = new ethers.Contract(quoter, quoterV2Abi, provider);
+  const q1 = quoterV1Addr ? new ethers.Contract(quoterV1Addr, quoterV1Abi, provider) : null;
+  const q2 = quoterV2Addr ? new ethers.Contract(quoterV2Addr, quoterV2Abi, provider) : null;
+
   async function quoteETHForUSDC(outUSDC) {
-    try {
-      return await q2.quoteExactOutputSingle.staticCall({ tokenIn: weth, tokenOut: usdc, fee: feeTier, amountOut: outUSDC, sqrtPriceLimitX96: 0 });
-    } catch {
-      return await q1.quoteExactOutputSingle.staticCall(weth, usdc, outUSDC, feeTier, 0);
+    if (q2) {
+      try {
+        const params = { tokenIn: weth, tokenOut: usdc, amount: outUSDC, fee: feeTier, sqrtPriceLimitX96: 0 };
+        const [amountIn] = await q2.quoteExactOutputSingle.staticCall(params);
+        return amountIn;
+      } catch {}
     }
+    if (q1) {
+      const amountIn = await q1.quoteExactOutputSingle.staticCall(weth, usdc, feeTier, outUSDC, 0);
+      return amountIn;
+    }
+    throw new Error("Quoter unavailable");
   }
 
   let wantRecipient = wantRecipient0;
@@ -84,7 +102,7 @@ const { ethers } = require("ethers");
 
   const operatorAddr = await operator.getAddress();
   const senderAddr = await payer.getAddress();
-  const chainId = BigInt((await provider.getNetwork()).chainId);
+  const chainId = (await provider.getNetwork()).chainId;
   const idBytes16 = ethers.hexlify(ethers.randomBytes(16));
 
   const packed = ethers.solidityPackedKeccak256(
